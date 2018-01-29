@@ -9,3 +9,7 @@ TODO:
     - vent is open
     - water pump is running
     - cutting head air is flowing
+
+Based on:
+- Adafruit MQTT Library ESP8266 Adafruit IO SSL/TLS example
+- Pieter P's excellent introduction to the ESP8266: https://tttapa.github.io/ESP8266/Chap16%20-%20Data%20Logging.html

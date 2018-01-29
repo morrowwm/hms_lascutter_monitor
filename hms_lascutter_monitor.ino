@@ -30,7 +30,7 @@
 
 #define ONE_HOUR 3600000UL
 
-/************************* Temperature Sensors *********************************/
+/************************* Temperature and other Sensors *********************************/
 
 #define TEMP_SENSOR_PIN D4
 #define ONE_WIRE_MAX_DEV 15 //The maximum number of devices
@@ -38,6 +38,10 @@ OneWire oneWire(TEMP_SENSOR_PIN);        // Set up a OneWire instance to communi
 
 DallasTemperature tempSensors(&oneWire); // Create an instance of the temperature sensor class
 int numberOfDevices = 0;
+
+const int GATE_OPEN = D7;   // 
+const int GATE_CLOSED = D3; // 
+const int BLAST_GATE_READY = D6;
 
 const char* dataFile = "/smellyroom.csv";
 /************************* WiFi Access Point *********************************/
@@ -62,7 +66,7 @@ WiFiUDP UDP;                   // Create an instance of the WiFiUDP class to sen
 
 #define AIO_SERVER      "io.adafruit.com"
 #define AIO_SERVERPORT  8883                   // 8883 for MQTTS
-
+// see secrets.h
 
 /************ Global State (you don't need to change this!) ******************/
 
@@ -79,8 +83,8 @@ const char* fingerprint = "AD 4B 64 B3 67 40 B5 FC 0E 51 9B BD 25 E9 7F 88 B6 2A
 
 // Setup a feed to publish to.
 // Notice MQTT paths for AIO follow the form: <username>/feeds/<feedname>
-Adafruit_MQTT_Publish temperatureIO = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/smelly_room_temperature");
 
+Adafruit_MQTT_Publish temperatureIO = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/test_point");
 /*************************** Sketch Code ************************************/
 
 // Bug workaround for Arduino 1.6.6, it seems to need a function declaration
@@ -91,9 +95,14 @@ void verifyFingerprint();
 void setup() {
   Serial.begin(115200);
   delay(10);
+  DeviceAddress ds18b20Address;
 
   tempSensors.setWaitForConversion(false); // Don't block the program while the temperature sensor is reading
   tempSensors.begin();                     // Start the temperature sensor
+
+  pinMode(GATE_OPEN, INPUT_PULLUP);
+  pinMode(GATE_CLOSED, INPUT_PULLUP);
+  pinMode(BLAST_GATE_READY, OUTPUT);
 
   numberOfDevices = tempSensors.getDeviceCount();
   if (numberOfDevices == 0) {
@@ -101,13 +110,14 @@ void setup() {
     Serial.flush();
     ESP.reset();
   }
+  for(int i = 0; i < numberOfDevices; i++)  {
+    if(tempSensors.getAddress(ds18b20Address, i))
+    {
+      tempSensors.setResolution(ds18b20Address, 12);
+    }
+  }
 
   Serial.println(F("Adafruit IO MQTTS (SSL/TLS) of HMS temperatures"));
-
-  // Connect to WiFi access point.
-  Serial.println(); Serial.println();
-  Serial.print("Connecting to ");
-  Serial.println(WLAN_SSID);
 
   startWiFi();
   startOTA();                  // Start the OTA service
@@ -140,10 +150,38 @@ unsigned long lastReadTime = -600000;
 unsigned long lastPublishTime = -600000;
 
 const unsigned long DS_delay = 750;         // Reading the temperature from the DS18x20 can take up to 750ms
+const unsigned long switchBounce = 750;     // give switches some time to bounce
+
 bool tmpRequested = false;
+unsigned long lastSwitchRead = -600000;
+
+int gateOpen = 0, gateClosed = 0, lastGateOpen = 0, lastGateClosed = 0;
 
 void loop() {
   unsigned long currentMillis = millis();
+
+  gateOpen = digitalRead(GATE_OPEN);
+  gateClosed = digitalRead(GATE_CLOSED);
+  if (currentMillis - lastSwitchRead > switchBounce) { // Request the time from the time server every hour
+    lastSwitchRead = currentMillis;     
+    if(gateOpen != lastGateOpen){
+      lastGateOpen = gateOpen;
+      Serial.print("Open switch now: "); Serial.println(gateOpen);
+    }
+    if(gateClosed != lastGateClosed){
+      lastGateClosed = gateClosed;
+      Serial.print("Closed switch now: "); Serial.println(gateClosed);
+    }
+  }  
+  // Light LED according to gate position
+  // TODO: and air feed, and blower state, and water, ...
+  // a 1 means the switch is open. The blast gate is open if:
+  if( gateOpen == 0 && gateClosed == 1){
+    digitalWrite(BLAST_GATE_READY, HIGH);
+  }
+  else{
+    digitalWrite(BLAST_GATE_READY, LOW);  
+  }
   
   if (currentMillis - prevNTP > intervalNTP) { // Request the time from the time server every hour
     prevNTP = currentMillis;
@@ -166,17 +204,18 @@ void loop() {
   // Ensure the connection to the MQTT server is alive (this will make the first
   // connection and automatically reconnect when disconnected).  See the MQTT_connect
   // function definition further below.
+  
   MQTT_connect();
 
   if (currentMillis - lastReadTime > dataInterval) {  // Every minute, request the temperature
     lastReadTime = currentMillis;
     tempSensors.requestTemperatures(); // Request the temperature from the sensor (it takes some time to read it)
     tmpRequested = true;
-    Serial.print("Current time: "); Serial.print(currentMillis/1000);
-    Serial.print(" Last publish: "); Serial.print(lastPublishTime/1000);
-    Serial.print(" Last data: "); Serial.print(lastReadTime/1000);
-    Serial.print(" Last temperature: "); Serial.print(lastTemperature);
-    Serial.print(" Temperature is ...");
+    Serial.print("runtime: "); Serial.print(currentMillis/1000);
+    Serial.print(" Last pub: "); Serial.print(lastPublishTime/1000);
+    Serial.print(" Last read: "); Serial.print(lastReadTime/1000);
+    Serial.print(" Last value: "); Serial.print(lastTemperature);
+    Serial.print(" New value is ...");
   }
   if (currentMillis - lastReadTime > DS_delay && tmpRequested) { // 750 ms after requesting the temperature
     tmpRequested = false;          
@@ -194,39 +233,47 @@ void loop() {
   }
   
   if (currentMillis - lastPublishTime > publishInterval) { 
-    lastPublishTime = currentMillis;
-    Serial.print(F("\nSending temperature "));
-    Serial.print(temperature[0]);
-    Serial.print(F(" to feed..."));
-    if (! temperatureIO.publish(temperature[0])) {
-      Serial.println(F("Failed"));
-    } else {
-      Serial.println(F("OK!"));
+    if( temperature[0] < -50.0 or temperature[0] > 50.0){
+      Serial.print("Not sending invlid value of:"); Serial.println(temperature[0]);
     }
-
-    if (timeUNIX != 0) {
-      uint32_t actualTime = timeUNIX + (currentMillis - lastNTPResponse) / 1000;
-      
-      File tempLog = SPIFFS.open(dataFile, "a"); // Write the time and the temperatures to the csv file
-      tempLog.print(actualTime);
-            
-      for(int i=0; i< numberOfDevices; i++){
-        temperature[i] = tempSensors.getTempCByIndex(i); // Get the temperature from the sensor
-        temperature[i] = round(temperature[i] * 100.0) / 100.0; // round temperature to 2 digits after decimal
-        
-        Serial.printf("Appending temperature %d to file: %lu,", i, actualTime);
-        Serial.println(temperature[i]);
-        
-        tempLog.print(','); tempLog.print(temperature[i]);
+    else{
+      lastPublishTime = currentMillis;
+      Serial.print(F("\nSending temperature "));
+      Serial.print(temperature[0]);
+      Serial.print(F(" to feed..."));
+  #if 1
+      if (! temperatureIO.publish(temperature[0])) {
+        Serial.println(F("Failed"));
+      } else {
+        Serial.println(F("OK!"));
       }
-      tempLog.println();
-      tempLog.close();
-    }
-    else {                                    // If we didn't receive an NTP response yet, send another request
-      sendNTPpacket(timeServerIP);
-      delay(500);
+  #endif
+      if (timeUNIX != 0) {
+        uint32_t actualTime = timeUNIX + (currentMillis - lastNTPResponse) / 1000;
+        
+        File tempLog = SPIFFS.open(dataFile, "a"); // Write the time and the temperatures to the csv file
+        tempLog.print(actualTime);
+              
+        for(int i=0; i< numberOfDevices; i++){
+          temperature[i] = tempSensors.getTempCByIndex(i); // Get the temperature from the sensor
+          temperature[i] = round(temperature[i] * 100.0) / 100.0; // round temperature to 2 digits after decimal
+          
+          Serial.printf("Appending temperature %d to file: %lu,", i, actualTime);
+          Serial.println(temperature[i]);
+          
+          tempLog.print(','); tempLog.print(temperature[i]);
+        }
+        tempLog.println();
+        tempLog.close();
+      }
+      else {                                    // If we didn't receive an NTP response yet, send another request
+        sendNTPpacket(timeServerIP);
+        delay(500);
+      }
     }
   }
+
+  
   server.handleClient();                      // run the server
   ArduinoOTA.handle();                        // listen for OTA events
   webSocket.loop();
@@ -288,8 +335,14 @@ void MQTT_connect() {
 
 void startWiFi() { // Try to connect to some given access points. Then wait for a connection
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WLAN_SSID, WLAN_PASS);
-  Serial.println("Connecting");
+  // static IP 
+  //WiFi.config(ip, dns, gateway, subnet);
+  WiFi.begin(WLAN_SSID, WLAN_PASS); 
+  
+    // Connect to WiFi access point.
+  Serial.println(); 
+  Serial.print("Connecting to "); Serial.print(WLAN_SSID);
+
   while (WiFi.status() != WL_CONNECTED) {  // Wait for the Wi-Fi to connect
     delay(250);
     Serial.print('.');
@@ -304,8 +357,8 @@ void startWiFi() { // Try to connect to some given access points. Then wait for 
 
 void startSPIFFS() { // Start the SPIFFS and list all contents
   SPIFFS.begin();                             // Start the SPI Flash File System (SPIFFS)
-  //SPIFFS.remove("/upstairs.csv");
-  //SPIFFS.remove("/upstairs.csv.gz");
+  SPIFFS.remove("/baseboard.csv");
+  SPIFFS.remove("/redroom.csv");
   Serial.println("SPIFFS started. Contents:");
   {
     Dir dir = SPIFFS.openDir("/");
