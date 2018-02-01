@@ -1,20 +1,5 @@
 /***************************************************
-  Adafruit MQTT Library ESP8266 Adafruit IO SSL/TLS example
-
-  Must use the latest version of ESP8266 Arduino from:
-    https://github.com/esp8266/Arduino
-
-  Works great with Adafruit's Huzzah ESP board & Feather
-  ----> https://www.adafruit.com/product/2471
-  ----> https://www.adafruit.com/products/2821
-
-  Adafruit invests time and resources providing this open source code,
-  please support Adafruit and open-source hardware by purchasing
-  products from Adafruit!
-
-  Written by Tony DiCola for Adafruit Industries.
-  SSL/TLS additions by Todd Treece for Adafruit Industries.
-  MIT license, all text above must be included in any redistribution
+Monitor for HMS laser cutter
  ****************************************************/
 #include <ESP8266WiFi.h>
 #include <DallasTemperature.h>
@@ -22,8 +7,7 @@
 #include <FS.h>
 #include <ESP8266WebServer.h>
 #include <WiFiUdp.h>
-#include "Adafruit_MQTT.h"
-#include "Adafruit_MQTT_Client.h"
+#include "AdafruitIO_WiFi.h"
 #include <WebSocketsClient.h>
 #include <WebSocketsServer.h>
 #include "secrets.h"
@@ -39,9 +23,10 @@ OneWire oneWire(TEMP_SENSOR_PIN);        // Set up a OneWire instance to communi
 DallasTemperature tempSensors(&oneWire); // Create an instance of the temperature sensor class
 int numberOfDevices = 0;
 
-const int GATE_OPEN = D7;   // 
-const int GATE_CLOSED = D3; // 
-const int BLAST_GATE_READY = D6;
+const int GATE_OPEN = D3;   // 
+const int GATE_CLOSED = D7; // 
+const int READY_TO_CUT = D6;
+const int NOT_READY_TO_CUT = D5;
 
 const char* dataFile = "/smellyroom.csv";
 /************************* WiFi Access Point *********************************/
@@ -64,8 +49,6 @@ WiFiUDP UDP;                   // Create an instance of the WiFiUDP class to sen
 
 /************************* Adafruit.io Setup *********************************/
 
-#define AIO_SERVER      "io.adafruit.com"
-#define AIO_SERVERPORT  8883                   // 8883 for MQTTS
 // see secrets.h
 
 /************ Global State (you don't need to change this!) ******************/
@@ -73,24 +56,13 @@ WiFiUDP UDP;                   // Create an instance of the WiFiUDP class to sen
 // WiFiFlientSecure for SSL/TLS support
 WiFiClientSecure client;
 
-// Setup the MQTT client class by passing in the WiFi client and MQTT server and login details.
-Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO_KEY);
-
-// io.adafruit.com SHA1 fingerprint
-const char* fingerprint = "AD 4B 64 B3 67 40 B5 FC 0E 51 9B BD 25 E9 7F 88 B6 2A A3 5B";
+AdafruitIO_WiFi io(AIO_USERNAME, AIO_KEY, WLAN_SSID, WLAN_PASS);
 
 /****************************** Feeds ***************************************/
 
 // Setup a feed to publish to.
 // Notice MQTT paths for AIO follow the form: <username>/feeds/<feedname>
-
-Adafruit_MQTT_Publish temperatureIO = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/test_point");
-/*************************** Sketch Code ************************************/
-
-// Bug workaround for Arduino 1.6.6, it seems to need a function declaration
-// for some reason (only affects ESP8266, likely an arduino-builder bug).
-void MQTT_connect();
-void verifyFingerprint();
+AdafruitIO_Feed *temperatureIO = io.feed("smelly_room_temperature");
 
 void setup() {
   Serial.begin(115200);
@@ -102,12 +74,17 @@ void setup() {
 
   pinMode(GATE_OPEN, INPUT_PULLUP);
   pinMode(GATE_CLOSED, INPUT_PULLUP);
-  pinMode(BLAST_GATE_READY, OUTPUT);
+  pinMode(READY_TO_CUT, OUTPUT);
+  pinMode(NOT_READY_TO_CUT, OUTPUT);
 
   numberOfDevices = tempSensors.getDeviceCount();
-  if (numberOfDevices == 0) {
+  if (numberOfDevices > 0) {
+    Serial.printf("Found %d sensors\r\n", numberOfDevices);
+  }
+  else{
     Serial.printf("No DS18x20 temperature sensor found on pin %d. Rebooting.\r\n", TEMP_SENSOR_PIN);
     Serial.flush();
+    delay(2000);
     ESP.reset();
   }
   for(int i = 0; i < numberOfDevices; i++)  {
@@ -131,9 +108,15 @@ void setup() {
 
   sendNTPpacket(timeServerIP);
   delay(500);
-  
-  // check the fingerprint of io.adafruit.com's SSL cert
-  verifyFingerprint();
+
+  // connect to io.adafruit.com
+  io.connect();
+  while(io.status() < AIO_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  // we are connected
+  Serial.println(); Serial.println(io.statusText());
 }
 
 float temperature[ONE_WIRE_MAX_DEV];
@@ -145,7 +128,7 @@ unsigned long lastNTPResponse = millis();
 uint32_t timeUNIX = 0;                      // The most recent timestamp received from the time server
 
 const unsigned long dataInterval = 2000;   // Do a temperature measurement 2 seconds
-const unsigned long publishInterval = 60000;   // Publish every 5 minutes
+const unsigned long publishInterval = 300000;   // Publish every 5 minutes - 300000 ms
 unsigned long lastReadTime = -600000;
 unsigned long lastPublishTime = -600000;
 
@@ -159,6 +142,8 @@ int gateOpen = 0, gateClosed = 0, lastGateOpen = 0, lastGateClosed = 0;
 
 void loop() {
   unsigned long currentMillis = millis();
+
+  io.run();
 
   gateOpen = digitalRead(GATE_OPEN);
   gateClosed = digitalRead(GATE_CLOSED);
@@ -177,10 +162,12 @@ void loop() {
   // TODO: and air feed, and blower state, and water, ...
   // a 1 means the switch is open. The blast gate is open if:
   if( gateOpen == 0 && gateClosed == 1){
-    digitalWrite(BLAST_GATE_READY, HIGH);
+    digitalWrite(READY_TO_CUT, HIGH);
+    digitalWrite(NOT_READY_TO_CUT, LOW);
   }
   else{
-    digitalWrite(BLAST_GATE_READY, LOW);  
+    digitalWrite(NOT_READY_TO_CUT, HIGH);  
+    digitalWrite(READY_TO_CUT, LOW);
   }
   
   if (currentMillis - prevNTP > intervalNTP) { // Request the time from the time server every hour
@@ -200,12 +187,6 @@ void loop() {
     Serial.flush();
     ESP.reset();
   }
-  
-  // Ensure the connection to the MQTT server is alive (this will make the first
-  // connection and automatically reconnect when disconnected).  See the MQTT_connect
-  // function definition further below.
-  
-  MQTT_connect();
 
   if (currentMillis - lastReadTime > dataInterval) {  // Every minute, request the temperature
     lastReadTime = currentMillis;
@@ -213,9 +194,9 @@ void loop() {
     tmpRequested = true;
     Serial.print("runtime: "); Serial.print(currentMillis/1000);
     Serial.print(" Last pub: "); Serial.print(lastPublishTime/1000);
-    Serial.print(" Last read: "); Serial.print(lastReadTime/1000);
-    Serial.print(" Last value: "); Serial.print(lastTemperature);
-    Serial.print(" New value is ...");
+    Serial.print(" read: "); Serial.print(lastReadTime/1000);
+    Serial.print(" val: "); Serial.print(lastTemperature);
+    Serial.print(" New vals 0: ");
   }
   if (currentMillis - lastReadTime > DS_delay && tmpRequested) { // 750 ms after requesting the temperature
     tmpRequested = false;          
@@ -223,7 +204,8 @@ void loop() {
       temperature[i] = tempSensors.getTempCByIndex(i); // Get the temperature from the sensor
       temperature[i] = round(temperature[i] * 100.0) / 100.0; // round temperature to 2 digits after decimal
     }
-    Serial.println(temperature[0]);
+    Serial.print(temperature[0]);
+    Serial.print(" 1: "); Serial.println(temperature[1]);
   }
 
   if(fabs(temperature[0] - lastTemperature) > 1.0){
@@ -233,20 +215,16 @@ void loop() {
   }
   
   if (currentMillis - lastPublishTime > publishInterval) { 
+    lastPublishTime = currentMillis;
     if( temperature[0] < -50.0 or temperature[0] > 50.0){
-      Serial.print("Not sending invlid value of:"); Serial.println(temperature[0]);
+      Serial.print("Not sending invalid value of:"); Serial.println(temperature[0]);
     }
     else{
-      lastPublishTime = currentMillis;
       Serial.print(F("\nSending temperature "));
       Serial.print(temperature[0]);
       Serial.print(F(" to feed..."));
   #if 1
-      if (! temperatureIO.publish(temperature[0])) {
-        Serial.println(F("Failed"));
-      } else {
-        Serial.println(F("OK!"));
-      }
+      temperatureIO->save(temperature[0]);
   #endif
       if (timeUNIX != 0) {
         uint32_t actualTime = timeUNIX + (currentMillis - lastNTPResponse) / 1000;
@@ -283,56 +261,6 @@ void loop() {
 
 }
 
-
-void verifyFingerprint() {
-
-  const char* host = AIO_SERVER;
-
-  Serial.print("Connecting to ");
-  Serial.println(host);
-
-  if (! client.connect(host, AIO_SERVERPORT)) {
-    Serial.println("Connection failed. Halting execution.");
-    while(1);
-  }
-
-  if (client.verify(fingerprint, host)) {
-    Serial.println("Connection secure.");
-  } else {
-    Serial.println("Connection insecure! Halting execution.");
-    while(1);
-  }
-
-}
-
-// Function to connect and reconnect as necessary to the MQTT server.
-// Should be called in the loop function and it will take care if connecting.
-void MQTT_connect() {
-  int8_t ret;
-
-  // Stop if already connected.
-  if (mqtt.connected()) {
-    return;
-  }
-
-  Serial.print("Connecting to MQTT... ");
-
-  uint8_t retries = 3;
-  while ((ret = mqtt.connect()) != 0) { // connect will return 0 for connected
-       Serial.println(mqtt.connectErrorString(ret));
-       Serial.println("Retrying MQTT connection in 5 seconds...");
-       mqtt.disconnect();
-       delay(5000);  // wait 5 seconds
-       retries--;
-       if (retries == 0) {
-         // basically die and wait for WDT to reset me
-         while (1);
-       }
-  }
-
-  Serial.println("MQTT Connected!");
-}
-
 void startWiFi() { // Try to connect to some given access points. Then wait for a connection
   WiFi.mode(WIFI_STA);
   // static IP 
@@ -359,6 +287,7 @@ void startSPIFFS() { // Start the SPIFFS and list all contents
   SPIFFS.begin();                             // Start the SPI Flash File System (SPIFFS)
   SPIFFS.remove("/baseboard.csv");
   SPIFFS.remove("/redroom.csv");
+  //SPIFFS.remove("/smelly room.csv");
   Serial.println("SPIFFS started. Contents:");
   {
     Dir dir = SPIFFS.openDir("/");
