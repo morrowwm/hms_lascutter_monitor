@@ -2,7 +2,7 @@ An Arduino sketch to run on a nodeMCU and mononitor the environment around the l
 
 - log temperature, locally on the nodeMCU's spiff
 - upload to io.adafruit.com, currently at https://io.adafruit.com/morrowwm/dashboards/maker-space
-- send alarm to Telegram is temperature is too low (< 10C) or too high (> 25C)
+- send alarm to Telegram if temperature is too low (< 10C) or too high (> 25C)
 
 TODO:
 - indicate if the cutter is ready to cut:
