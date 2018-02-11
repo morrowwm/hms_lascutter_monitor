@@ -1,12 +1,13 @@
 An Arduino sketch to run on a nodeMCU and mononitor the environment around the laser cutter.
 
 - log temperature, locally on the nodeMCU's spiff
-- upload to io.adafruit.com
+- upload to io.adafruit.com, currently at https://io.adafruit.com/morrowwm/dashboards/maker-space
+- send alarm to Telegram is temperature is too low (< 10C) or too high (> 25C)
 
 TODO:
-- alarm if temperature gets low enough to risk freezing the laser's water jacket
 - indicate if the cutter is ready to cut:
     - vent is open
+    - vent blower is running
     - water pump is running
     - cutting head air is flowing
 
