@@ -157,12 +157,13 @@ bool tmpRequested = false;
 unsigned long lastSwitchRead = -600000;
 
 int gateOpen = 0, gateClosed = 0, lastGateOpen = 0, lastGateClosed = 0;
+unsigned long lastMovedFromClosed = 0;
 
 void loop() {
   unsigned long currentMillis = millis();
 
-  gateOpen = digitalRead(GATE_OPEN);
-  gateClosed = digitalRead(GATE_CLOSED);
+  gateOpen = (digitalRead(GATE_OPEN) == 0); // switches are reverse logic
+  gateClosed = (digitalRead(GATE_CLOSED) == 0);
   if (currentMillis - lastSwitchRead > switchBounce) { // Request the time from the time server every hour
     lastSwitchRead = currentMillis;     
     if(gateOpen != lastGateOpen){
@@ -172,6 +173,9 @@ void loop() {
     if(gateClosed != lastGateClosed){
       lastGateClosed = gateClosed;
       Serial.print("Closed switch now: "); Serial.println(gateClosed);
+      if(gateClosed == 0){
+        lastMovedFromClosed = currentMillis;;
+      }
     }
   }  
   // Light LED according to gate position
@@ -252,10 +256,6 @@ void loop() {
       if (! temperatureIO.publish(ventTemperature)) {
           Serial.println(F("Failed to publish"));
       }
-      if (mqtt.connected()) {
-        Serial.println("Already connected");
-        return;
-      }
       
       if (timeUNIX != 0) {
         uint32_t actualTime = timeUNIX + (currentMillis - lastNTPResponse) / 1000;
@@ -288,9 +288,9 @@ void loop() {
       char alarmValStr[8];
       dtostrf(ventTemperature, 5, 1, alarmValStr);
       
-      String alarmMessage = "The HMS laser cutter vent temperature is now normal at ";
+      String alarmMessage = "TEST: The HMS laser cutter vent temperature is now normal at ";
       alarmMessage += String(alarmValStr) + "C.\nThe blast gate is ";  
-      alarmMessage += (gateClosed == 0) ? "closed." : "open."; 
+      alarmMessage += (gateClosed == 1) ? "closed." : "open."; 
       Serial.println(alarmMessage);
       sendMessageToAllSubscribedUsers(alarmMessage);
    }
@@ -303,9 +303,9 @@ void loop() {
       
       char alarmValStr[8];
       dtostrf(ventTemperature, 5, 1, alarmValStr);
-      String alarmMessage = "The HMS laser cutter vent temperature is currently ";
+      String alarmMessage = "TEST: The HMS laser cutter vent temperature is currently ";
       alarmMessage += String(alarmValStr) + "C.\nThe blast gate is ";
-      alarmMessage += (gateClosed == 0) ? "closed." : "open.";
+      alarmMessage += (gateClosed == 1) ? "closed." : "open.";
 
       Serial.println(alarmMessage);
       sendMessageToAllSubscribedUsers(alarmMessage);
@@ -515,16 +515,38 @@ void handleNewMessages(int numNewMessages) {
       if (addSubscribedUser(chat_id, from_name)) {
         String welcome = "Welcome to the HMS monitor Telegram Bot, " + from_name + ".\n";
         welcome += "Try these commands.\n\n";
+        welcome += "/current : current conditions being monitored\n";
         welcome += "/showallusers : show all subscribed users\n";
-        welcome += "/testbulkmessage : send test message to subscribed users\n";
         welcome += "/removeallusers : remove all subscribed users\n";
+        welcome += "/testbulkmessage : send test message to subscribed users\n";
         welcome += "/stop : unsubscribe from bot\n";
-        welcome += "/start : resubscribe from bot\n";
+        welcome += "/start : resubscribe from bot\n\n";
+        welcome += "trend at: https://io.adafruit.com/morrowwm/dashboards/maker-space";
     
         bot.sendMessage(chat_id, welcome, "Markdown");
       } else {
         bot.sendMessage(chat_id, "Something wrong, please try again (later?)", "");
       }
+    }
+    if (text == "/current") { 
+      // Summary, then detail
+      String message = "VENT: " + String(int(ventTemperature));
+      message += (gateClosed == 1) ? "C. CLOSED." : "C. OPEN.";
+      
+      message += "\n\nThe HMS laser cutter vent temperature is currently ";
+
+      char valStr[8];
+      dtostrf(ventTemperature, 5, 1, valStr);
+      
+      message += String(valStr) + "C.\nThe blast gate is ";
+      message += (gateClosed == 1) ? "closed." : "open.";
+      message += " It was last opened ";
+      dtostrf((millis()-lastMovedFromClosed)/60000, 5, 0, valStr);
+      message += String((millis()-lastMovedFromClosed)/60000) + " minutes ago.\n";
+      message += "Local server is http://" + WiFi.localIP().toString();
+
+      Serial.println(message);
+      bot.sendMessage(chat_id, message);
     }
 
     if (text == "/stop") {
@@ -536,7 +558,7 @@ void handleNewMessages(int numNewMessages) {
     }
 
     if (text == "/testbulkmessage") {
-      sendMessageToAllSubscribedUsers("ATTENTION, this is bulk message for all subscribed users!");
+      sendMessageToAllSubscribedUsers("TEST: This is a test broadcast to all subscribed users!");
     }
 
     if (text == "/showallusers") {
@@ -646,7 +668,9 @@ void sendMessageToAllSubscribedUsers(String message) {
 
     if (users_processed < messages_limit_per_second)  {
       const char* chat_id = it->key;
-      bot.sendMessage(chat_id, message, "");
+      if(chat_id != "") {
+          bot.sendMessage(chat_id, message, "");
+      }
     } else {
       delay(bulk_messages_mtbs);
       users_processed = 0;
