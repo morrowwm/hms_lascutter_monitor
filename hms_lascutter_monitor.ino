@@ -3,12 +3,9 @@ Monitor for HMS laser cutter
  ****************************************************/
 #include <ESP8266WiFi.h>
 #include <DallasTemperature.h>
-#include <ArduinoOTA.h>
 #include <FS.h>
 #include <ESP8266WebServer.h>
 #include <WiFiUdp.h>
-#include <Adafruit_MQTT.h>
-#include <Adafruit_MQTT_Client.h>
 #include <WebSocketsClient.h>
 #include <WebSocketsServer.h>
 #include <UniversalTelegramBot.h>
@@ -32,15 +29,13 @@ const int GATE_CLOSED = D7; //
 const int READY_TO_CUT = D6;
 const int NOT_READY_TO_CUT = D5;
 
-const char* dataFile = "/smellyroom.csv";
 /************************* WiFi Access Point *********************************/
 // in secrets.h
 
 WiFiClientSecure client;
 
 /************************* Web Server, NTP , Telegram*********************************/
-ESP8266WebServer server(80);       // create a web server on port 80
-File fsUploadFile;                                    // a File variable to temporarily store the received file
+ESP8266WebServer server(80);       // create a web server on port 80                                  // a File variable to temporarily store the received file
 
 const int NTP_PACKET_SIZE = 48;          // NTP time stamp is in the first 48 bytes of the message
 byte packetBuffer[NTP_PACKET_SIZE];      // A buffer to hold incoming and outgoing packets
@@ -52,8 +47,14 @@ WebSocketsClient webSocket;
 // Telegram config
 UniversalTelegramBot bot(BOTtoken, client);
 
-int botInterval = 1000; //mean time between scan messages 1000ms = 1 sec
-long lastBotTime;
+/*
+ * mean time between scan messages 1000ms = 1 sec
+ * keep this a few seconds longer than the data read interval, to keep timing right
+ * there's a blocking delay in the UniversalTelegramBot which make getUpdates take a few seconds
+ */
+
+unsigned long botInterval = 10000; 
+unsigned long lastBotTime;
 
 int bulk_messages_mtbs = 1500; // mean time between send messages, 1.5 seconds
 int messages_limit_per_second = 25; // Telegram API have limit for bulk messages ~30 messages per second
@@ -62,62 +63,21 @@ String subscribed_users_filename = "subscribed_users.json";
 
 DynamicJsonBuffer jsonBuffer;
 
-/************************* Over The Air updates *********************************/
+WiFiUDP UDP; 
 
-WiFiUDP UDP;                   // Create an instance of the WiFiUDP class to send and receive UDP messages
-
-/************************* Adafruit.io Setup *********************************/
-
-// see secrets.h
-
-/************ Global State (you don't need to change this!) ******************/
-Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO_KEY);
-
-/****************************** Feeds ***************************************/
-
-// Setup a feed to publish to.
-// Notice MQTT paths for AIO follow the form: <username>/feeds/<feedname>
-Adafruit_MQTT_Publish temperatureIO = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/test_point");
-
-// Function to connect and reconnect as necessary to the MQTT server.
-// Should be called in the loop function and it will take care if connecting.
-void MQTT_connect() {
-  int8_t ret;
-
-  // Stop if already connected.
-  if (mqtt.connected()) {
-    Serial.println("Already connected");
-    return;
-  }
-
-  Serial.print("Connecting to MQTT... ");
-
-  uint8_t retries = 3;
-  while ((ret = mqtt.connect()) != 0) { // connect will return 0 for connected
-       Serial.println(mqtt.connectErrorString(ret));
-       Serial.println("Retrying MQTT connection in 5 seconds...");
-       mqtt.disconnect();
-       delay(5000);  // wait 5 seconds
-       retries--;
-       if (retries == 0) {
-         // basically die and wait for WDT to reset me
-         return;
-       }
-  }
-  Serial.println("MQTT Connected!");
-}
+float temperature[ONE_WIRE_MAX_DEV];
+float lastTemperature = -100;
+float ventTemperature = 0.0;
+float lastAlarmVal = 0.0;
 
 void setup() {
   Serial.begin(115200);
   delay(10);
 
-  Serial.println(F("Adafruit IO MQTTS (SSL/TLS) of HMS temperatures"));
+  Serial.println(F("Monitor HMS laser cutter"));
 
   startWiFi();
   startSensors();
-  startOTA();                  // Start the OTA service
-  startSPIFFS();               // Start the SPIFFS and list all contents
-  startServer();               // Start a HTTP server with a file read handler and an upload handler
   startUDP();                  // Start listening for UDP messages to port 123
 
   UniversalTelegramBot bot(BOTtoken, client);
@@ -128,12 +88,12 @@ void setup() {
 
   sendNTPpacket(timeServerIP);
   delay(500);
-}
+  
+  String message = "The HMS laser cutter monitor is starting.";
+  Serial.println(message);
+  sendMessageToAllSubscribedUsers(message);
 
-float temperature[ONE_WIRE_MAX_DEV];
-float lastTemperature = -100;
-float ventTemperature = 0.0;
-float lastAlarmVal = 0.0;
+}
 
 const unsigned long intervalNTP = ONE_HOUR; // Update the time every hour
 unsigned long prevNTP = 0;
@@ -142,12 +102,11 @@ uint32_t timeUNIX = 0;                      // The most recent timestamp receive
 
 const unsigned long dataInterval = 2000;   // Do a temperature measurement 2 seconds
 const unsigned long publishInterval = 30000;   // Publish every 5 minutes - 300000 ms
-unsigned long lastReadTime = -600000;
-unsigned long lastPublishTime = -600000;
-
-unsigned long lastAlarmTime = -6000000; 
+long lastReadTime = -600000;
+long lastPublishTime = -600000;
+long lastAlarmTime = 10000; // set this to a bit after start to avoid startup spurious alarms
 const unsigned long alarmInterval = 30000;
-float lowAlarmLimit = 10.0, hiAlarmLimit = 25.0;
+float lowAlarmLimit = 10.0, hiAlarmLimit = 35.0;
 bool inAlarm = false;
 
 const unsigned long DS_delay = 750;         // Reading the temperature from the DS18x20 can take up to 750ms
@@ -161,7 +120,12 @@ unsigned long lastMovedFromClosed = 0;
 
 void loop() {
   unsigned long currentMillis = millis();
-
+  // if just started, don't do anything until we get a good reading
+  if(lastReadTime <= 0) {
+      lastReadTime = currentMillis + DS_delay;
+      ventTemperature = 0.5 * (hiAlarmLimit - lowAlarmLimit);
+  }
+    
   gateOpen = (digitalRead(GATE_OPEN) == 0); // switches are reverse logic
   gateClosed = (digitalRead(GATE_CLOSED) == 0);
   if (currentMillis - lastSwitchRead > switchBounce) { // Request the time from the time server every hour
@@ -178,6 +142,7 @@ void loop() {
       }
     }
   }  
+
   // Light LED according to gate position
   // TODO: and air feed, and blower state, and water, ...
   // a 1 means the switch is open. The blast gate is open if:
@@ -213,19 +178,21 @@ void loop() {
     tempSensors.requestTemperatures(); // Request the temperature from the sensor (it takes some time to read it)
     tmpRequested = true;
   }
+
   if (currentMillis - lastReadTime > DS_delay && tmpRequested) { // 750 ms after requesting the temperature
     tmpRequested = false;          
     for(int i=0; i< numberOfDevices; i++){
       temperature[i] = tempSensors.getTempCByIndex(i); // Get the temperature from the sensor
-      temperature[i] = round(temperature[i] * 100.0) / 100.0; // round temperature to 2 digits after decimal
+      temperature[i] = round(temperature[i] * 100.0) / 100.0; // round temperature to 2 digits after decimal   
     }
-    // if first value, just take it, otherwise smooth over last few readings
-    // Occasionally we get a bad reading?
-    if(lastTemperature == -100.0){
-      ventTemperature = temperature[0];
+    
+    if(temperature[0] < -40.0 && temperature[0] > 40.0){
+          // maybe report on this?
     }
-    ventTemperature = 0.1 * ventTemperature + 0.9 * temperature[0];
-
+    else{
+      ventTemperature = 0.9 * ventTemperature + 0.1 * temperature[0];
+    }
+    
     Serial.print("runtime: "); Serial.print(currentMillis/1000);
     Serial.print(" pub: "); Serial.print(lastPublishTime/1000);
     Serial.print(" read: "); Serial.print(lastReadTime/1000);
@@ -240,47 +207,6 @@ void loop() {
     }
     lastTemperature = ventTemperature;
   }
-  
-  if (currentMillis - lastPublishTime > publishInterval) { 
-    lastPublishTime = currentMillis;
-    if( ventTemperature < -50.0 or ventTemperature > 50.0){
-      Serial.print("Not sending invalid value of:"); Serial.println(temperature[0]);
-    }
-    else{
-      Serial.print(F("\nSending temperature "));
-      Serial.print(ventTemperature);
-      Serial.print(F(" to feed..."));
-
-      MQTT_connect();
-
-      if (! temperatureIO.publish(ventTemperature)) {
-          Serial.println(F("Failed to publish"));
-      }
-      
-      if (timeUNIX != 0) {
-        uint32_t actualTime = timeUNIX + (currentMillis - lastNTPResponse) / 1000;
-        
-        File tempLog = SPIFFS.open(dataFile, "a"); // Write the time and the temperatures to the csv file
-        tempLog.print(actualTime);
-              
-        for(int i=0; i< numberOfDevices; i++){
-          temperature[i] = tempSensors.getTempCByIndex(i); // Get the temperature from the sensor
-          temperature[i] = round(temperature[i] * 100.0) / 100.0; // round temperature to 2 digits after decimal
-          
-          Serial.printf("Appending temperature %d to file: %lu,", i, actualTime);
-          Serial.println(temperature[i]);
-          
-          tempLog.print(','); tempLog.print(temperature[i]);
-        }
-        tempLog.println();
-        tempLog.close();
-      }
-      else {                                    // If we didn't receive an NTP response yet, send another request
-        sendNTPpacket(timeServerIP);
-        delay(500);
-      }
-    }
-  }
 
   if(inAlarm && ventTemperature > lowAlarmLimit && ventTemperature < hiAlarmLimit){
       inAlarm = false;
@@ -288,7 +214,7 @@ void loop() {
       char alarmValStr[8];
       dtostrf(ventTemperature, 5, 1, alarmValStr);
       
-      String alarmMessage = "TEST: The HMS laser cutter vent temperature is now normal at ";
+      String alarmMessage = "Normal: The HMS laser cutter vent temperature is now normal at ";
       alarmMessage += String(alarmValStr) + "C.\nThe blast gate is ";  
       alarmMessage += (gateClosed == 1) ? "closed." : "open."; 
       Serial.println(alarmMessage);
@@ -303,7 +229,7 @@ void loop() {
       
       char alarmValStr[8];
       dtostrf(ventTemperature, 5, 1, alarmValStr);
-      String alarmMessage = "TEST: The HMS laser cutter vent temperature is currently ";
+      String alarmMessage = "Alarm: The HMS laser cutter vent temperature is currently ";
       alarmMessage += String(alarmValStr) + "C.\nThe blast gate is ";
       alarmMessage += (gateClosed == 1) ? "closed." : "open.";
 
@@ -312,19 +238,16 @@ void loop() {
   }
 
   if (currentMillis - lastBotTime > botInterval)  {
+      lastBotTime = currentMillis;
       int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
-
       while(numNewMessages) {
           Serial.print("got response ");
           handleNewMessages(numNewMessages);
           numNewMessages = bot.getUpdates(bot.last_message_received + 1);
-      }
-      
-      lastBotTime = currentMillis;
+      }     
   }
   
   server.handleClient();                      // run the server
-  ArduinoOTA.handle();                        // listen for OTA events
   webSocket.loop();
 }
 
@@ -379,22 +302,6 @@ void startWiFi() { // Try to connect to some given access points. Then wait for 
   Serial.println("\r\n");
 }
 
-void startSPIFFS() { // Start the SPIFFS and list all contents
-  SPIFFS.begin();                             // Start the SPI Flash File System (SPIFFS)
-  //SPIFFS.remove("/subscribed_users.json");
-  //SPIFFS.remove("/smelly room.csv");
-  Serial.println("SPIFFS started. Contents:");
-  {
-    Dir dir = SPIFFS.openDir("/");
-    while (dir.next()) {                      // List the file system contents
-      String fileName = dir.fileName();
-      size_t fileSize = dir.fileSize();
-      Serial.printf("\tFS File: %s, size: %s\r\n", fileName.c_str(), formatBytes(fileSize).c_str());
-    }
-    Serial.printf("\n");
-  }
-}
-
 void startUDP() {
   Serial.println("Starting UDP");
   UDP.begin(123);                          // Start listening for UDP messages to port 123
@@ -402,97 +309,7 @@ void startUDP() {
   Serial.println(UDP.localPort());
 }
 
-void startOTA() { // Start the OTA service
-  ArduinoOTA.setHostname(OTAName);
-  ArduinoOTA.setPassword(OTAPassword);
-
-  ArduinoOTA.onStart([]() {
-    Serial.println("Start");
-  });
-  ArduinoOTA.onEnd([]() {
-    Serial.println("\r\nEnd");
-  });
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
-  });
-  ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("Error[%u]: ", error);
-    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-    else if (error == OTA_END_ERROR) Serial.println("End Failed");
-  });
-  ArduinoOTA.begin();
-  Serial.println("OTA ready\r\n");
-}
-
-void startServer() { // Start a HTTP server with a file read handler and an upload handler
-  server.on("/edit.html",  HTTP_POST, []() {  // If a POST request is sent to the /edit.html address,
-    server.send(200, "text/plain", "");
-  }, handleFileUpload);                       // go to 'handleFileUpload'
-
-  server.onNotFound(handleNotFound);          // if someone requests any other file or page, go to function 'handleNotFound'
-  // and check if the file exists
-
-  server.begin();                             // start the HTTP server
-  Serial.println("HTTP server started.");
-}
-
 /*__________________________________________________________SERVER_HANDLERS__________________________________________________________*/
-
-void handleNotFound() { // if the requested file or page doesn't exist, return a 404 not found error
-  if (!handleFileRead(server.uri())) {        // check if the file exists in the flash memory (SPIFFS), if so, send it
-    server.send(404, "text/plain", "404: File Not Found");
-  }
-}
-
-bool handleFileRead(String path) { // send the right file to the client (if it exists)
-  Serial.println("handleFileRead: " + path);
-  if (path.endsWith("/")) path += "index.html";          // If a folder is requested, send the index file
-  String contentType = getContentType(path);             // Get the MIME type
-  String pathWithGz = path + ".gz";
-  if (SPIFFS.exists(pathWithGz) || SPIFFS.exists(path)) { // If the file exists, either as a compressed archive, or normal
-    if (SPIFFS.exists(pathWithGz))                         // If there's a compressed version available
-      path += ".gz";                                         // Use the compressed verion
-    File file = SPIFFS.open(path, "r");                    // Open the file
-    size_t sent = server.streamFile(file, contentType);    // Send it to the client
-    file.close();                                          // Close the file again
-    Serial.println(String("\tSent file: ") + path);
-    return true;
-  }
-  Serial.println(String("\tFile Not Found: ") + path);   // If the file doesn't exist, return false
-  return false;
-}
-
-void handleFileUpload() { // upload a new file to the SPIFFS
-  HTTPUpload& upload = server.upload();
-  String path;
-  if (upload.status == UPLOAD_FILE_START) {
-    path = upload.filename;
-    if (!path.startsWith("/")) path = "/" + path;
-    if (!path.endsWith(".gz")) {                         // The file server always prefers a compressed version of a file
-      String pathWithGz = path + ".gz";                  // So if an uploaded file is not compressed, the existing compressed
-      if (SPIFFS.exists(pathWithGz))                     // version of that file must be deleted (if it exists)
-        SPIFFS.remove(pathWithGz);
-    }
-    Serial.print("handleFileUpload Name: "); Serial.println(path);
-    fsUploadFile = SPIFFS.open(path, "w");               // Open the file for writing in SPIFFS (create if it doesn't exist)
-    path = String();
-  } else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (fsUploadFile)
-      fsUploadFile.write(upload.buf, upload.currentSize); // Write the received bytes to the file
-  } else if (upload.status == UPLOAD_FILE_END) {
-    if (fsUploadFile) {                                   // If the file was successfully created
-      fsUploadFile.close();                               // Close the file again
-      Serial.print("handleFileUpload Size: "); Serial.println(upload.totalSize);
-      server.sendHeader("Location", "/success.html");     // Redirect the client to the success page
-      server.send(303);
-    } else {
-      server.send(500, "text/plain", "500: couldn't create file");
-    }
-  }
-}
 
 void handleNewMessages(int numNewMessages) {
   Serial.println("handleNewMessages");
@@ -521,7 +338,7 @@ void handleNewMessages(int numNewMessages) {
         welcome += "/testbulkmessage : send test message to subscribed users\n";
         welcome += "/stop : unsubscribe from bot\n";
         welcome += "/start : resubscribe from bot\n\n";
-        welcome += "trend at: https://io.adafruit.com/morrowwm/dashboards/maker-space";
+        //welcome += "trend at: https://io.adafruit.com/morrowwm/dashboards/maker-space";
     
         bot.sendMessage(chat_id, welcome, "Markdown");
       } else {
@@ -541,8 +358,13 @@ void handleNewMessages(int numNewMessages) {
       message += String(valStr) + "C.\nThe blast gate is ";
       message += (gateClosed == 1) ? "closed." : "open.";
       message += " It was last opened ";
-      dtostrf((millis()-lastMovedFromClosed)/60000, 5, 0, valStr);
-      message += String((millis()-lastMovedFromClosed)/60000) + " minutes ago.\n";
+      int openTime = (millis()-lastMovedFromClosed)/60000;
+      if (openTime > 120) { 
+        message += String(openTime/60) + " hours ago.\n";
+      }
+      else {
+        message += String(openTime) + " minutes ago.\n";
+      }
       message += "Local server is http://" + WiFi.localIP().toString();
 
       Serial.println(message);
@@ -558,7 +380,7 @@ void handleNewMessages(int numNewMessages) {
     }
 
     if (text == "/testbulkmessage") {
-      sendMessageToAllSubscribedUsers("TEST: This is a test broadcast to all subscribed users!");
+      sendMessageToAllSubscribedUsers("This is a test broadcast to all subscribed users!");
     }
 
     if (text == "/showallusers") {
@@ -574,6 +396,8 @@ void handleNewMessages(int numNewMessages) {
         bot.sendMessage(chat_id, "Subscribed users file is too large", "");
       } else {
           String file_content = subscribedUsersFile.readString();
+          Serial.println("Showing subscribers:");
+          Serial.println(file_content);
           bot.sendMessage(chat_id, file_content, "");
       }
     }
@@ -632,6 +456,7 @@ bool addSubscribedUser(String chat_id, String from_name) {
     //return false;
   }
 
+  Serial.print("Subscribing: "); Serial.println(from_name);
   users.set(chat_id, from_name);
   users.printTo(subscribedUsersFile);
 
@@ -668,7 +493,7 @@ void sendMessageToAllSubscribedUsers(String message) {
 
     if (users_processed < messages_limit_per_second)  {
       const char* chat_id = it->key;
-      if(chat_id != "") {
+      if(strcmp(chat_id, "") != 0) {
           bot.sendMessage(chat_id, message, "");
       }
     } else {
@@ -687,6 +512,9 @@ String formatBytes(size_t bytes) { // convert sizes in bytes to KB and MB
     return String(bytes / 1024.0) + "KB";
   } else if (bytes < (1024 * 1024 * 1024)) {
     return String(bytes / 1024.0 / 1024.0) + "MB";
+  }
+  else{
+    return String(bytes);
   }
 }
 
@@ -726,5 +554,3 @@ void sendNTPpacket(IPAddress& address) {
   UDP.write(packetBuffer, NTP_PACKET_SIZE);
   UDP.endPacket();
 }
-
-
